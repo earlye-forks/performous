@@ -255,6 +255,15 @@ jobs:
       - name: Clear Extended attributes
         run: |
           sudo find /opt/local/var -type d -a -perm 700 -exec chmod 755 {} \;
+          # actions/cache runs `tar` as the unprivileged `runner` user, and bsdtar
+          # exits 1 on the FIRST unreadable file, aborting the entire save. MacPorts
+          # installs a handful of root-owned, non-world-readable helpers -- notably
+          # dbus's setuid `dbus-daemon-launch-helper`, pulled in transitively by
+          # glib2 -- which `runner` cannot read. This is why upstream's macOS
+          # dependency cache has never saved, on either arm64 or Intel.
+          # a+rX adds read everywhere and search only on directories; it does not
+          # clear setuid, and /opt/local is a throwaway CI prefix.
+          sudo chmod -R a+rX /opt/local /Applications/MacPorts
           sudo xattr -c -rsv /opt/local
 
       - name: Cache dependencies
@@ -335,3 +344,22 @@ jobs:
         with:
           name: "MacPorts-log-${{ matrix.os }}-${{ steps.ver.outputs.short_sha }}.tar.gz"
           path: "${{ steps.get-logs.outputs.log_path }}"
+
+      # Last step in the job, so a cache regression fails the run loudly without
+      # costing the DMG -- which is already uploaded by the time this runs.
+      - name: Verify cache was saved
+        if: ${{ steps.restore_cache.outputs.cache-hit != 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CACHE_KEY: ${{ steps.cache-key.outputs.computed_cache_key }}
+        run: |
+          # `Lord-Kamina/always-upload-cache/save` (like actions/cache) downgrades
+          # every save failure to a ::warning:: and still reports step success, so a
+          # broken cache is invisible until you notice builds are permanently cold.
+          gh api "repos/${{ github.repository }}/actions/caches?key=${CACHE_KEY}" \
+            --jq '.actions_caches[] | "\(.size_in_bytes) bytes  ref=\(.ref)  \(.key)"'
+          n=$(gh api "repos/${{ github.repository }}/actions/caches?key=${CACHE_KEY}" --jq '.total_count')
+          if [ "${n}" -eq 0 ]; then
+            echo "::error::Cache save failed silently - no entry for ${CACHE_KEY}. Every subsequent build will be a ~70min cold build."
+            exit 1
+          fi
