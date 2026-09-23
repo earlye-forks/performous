@@ -1,0 +1,337 @@
+name: Earlye macOS DMG
+
+# FORK-LOCAL FILE. Not present upstream; upstream never touches it, so it survives
+# every `git rebase upstream/master` untouched.
+#
+# Why this is standalone instead of `uses: ./.github/workflows/macports.yml`:
+# macports.yml's upload steps are gated on `github.event_name == 'pull_request'`
+# or `github.ref == 'refs/heads/master'`. Those read the CALLER's triggering event,
+# so a push-triggered caller runs the whole 1-3h build and uploads nothing, and no
+# workflow_call input can change that. macports.yml also declares no outputs, so the
+# DMG cannot be handed back. Hence: own copy of the job.
+#
+# Keep the "Amend macports configuration" / "Install Dependencies" / cache-key steps
+# byte-identical to upstream's macports.yml so the dependency cache is SHARED with
+# any build_and_release.yml run in this repo. Re-sync them when upstream changes.
+
+on:
+  push:
+    branches-ignore:
+      - master          # master pushes are for syncing upstream, not for building
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: 'Which macOS builds to produce'
+        type: choice
+        default: arm64
+        options:
+          - arm64
+          - intel
+          - both
+      deployment_target:
+        description: 'Override macOS deployment target (blank = 15.0 arm64 / 12.0 intel). The default arm64/15.0 build is correct for the M4 on macOS 15.7; only lower this to produce a DMG for an older Mac, and note it changes the cache key and forces a cold rebuild.'
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: earlye-mac-dmg-${{ github.ref }}
+  # Cancel superseded feature-branch runs, but never kill a master run: master runs
+  # are what seed the default-branch-scoped dependency cache.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+jobs:
+  choose:
+    name: Choose builds
+    runs-on: ubuntu-latest
+    outputs:
+      include: ${{ steps.pick.outputs.include }}
+    steps:
+      - id: pick
+        env:
+          ARCH: ${{ inputs.arch || 'arm64' }}
+          TARGET_OVERRIDE: ${{ inputs.deployment_target }}
+        run: |
+          arm='{"os":"macos-26","target":"15.0"}'
+          intel='{"os":"macos-15-intel","target":"12.0"}'
+          if [[ -n "${TARGET_OVERRIDE}" ]]; then
+            arm="{\"os\":\"macos-26\",\"target\":\"${TARGET_OVERRIDE}\"}"
+            intel="{\"os\":\"macos-15-intel\",\"target\":\"${TARGET_OVERRIDE}\"}"
+          fi
+          case "${ARCH}" in
+            intel) include="[${intel}]" ;;
+            both)  include="[${arm},${intel}]" ;;
+            *)     include="[${arm}]" ;;
+          esac
+          echo "include=${include}" | tee -a "$GITHUB_OUTPUT"
+
+  dmg:
+    name: DMG (${{ matrix.os }} / target ${{ matrix.target }})
+    needs: choose
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.choose.outputs.include) }}
+    runs-on: '${{ matrix.os }}'
+    timeout-minutes: 350        # hard ceiling is 360; fail visibly rather than be killed
+    env:
+      BOOST_VERSION: '1.87'
+      MACOS_DEPS: >-
+        boost boost.version=1.87
+        cairo
+        cmake
+        cpprestsdk boost.version=1.87
+        dylibbundler
+        ffmpeg7
+        fftw-3-single
+        libfmt11
+        fontconfig
+        freetype
+        glm
+        gtest
+        help2man
+        icu
+        libepoxy
+        librsvg
+        libsdl2
+        libxmlxx5
+        nlohmann-json
+        opencv4
+        openssl
+        pango
+        portaudio
+        portmidi
+    steps:
+      - name: Checkout Git
+        uses: actions/checkout@v6
+        with:
+          path: performous
+          fetch-depth: 0        # needed for `git describe --tags`
+
+      - name: Compute version and artifact name
+        id: ver
+        run: |
+          cd "${{ github.workspace }}/performous"
+          RAW=$(git describe --tags --abbrev=0 2>/dev/null || true)
+          # macos-bundler.py's set_version() does a re.match for X.Y.Z and
+          # dereferences the match object unconditionally, so a two-component tag
+          # like "1.0" or a non-numeric tag crashes it. Normalise defensively.
+          NUM=$(printf '%s' "$RAW" | grep -Eo '^[0-9]+(\.[0-9]+){0,2}' || true)
+          [ -n "$NUM" ] || NUM="1.0.0"
+          while [ "$(printf '%s' "$NUM" | tr -cd '.' | wc -c | tr -d ' ')" -lt 2 ]; do NUM="${NUM}.0"; done
+          SHORT=$(git rev-parse --short=7 HEAD)
+          SAFE_REF=$(printf '%s' "${{ github.ref_name }}" | tr '/\\:<>|*?"' '-')
+          echo "package_version=${NUM}+git-${SHORT}" | tee -a "$GITHUB_OUTPUT"
+          echo "safe_ref=${SAFE_REF}"                | tee -a "$GITHUB_OUTPUT"
+          echo "short_sha=${SHORT}"                  | tee -a "$GITHUB_OUTPUT"
+
+      - name: Install Macports
+        uses: Lord-Kamina/setup-macports@78191c8e21d240aadf27da56614fd840b4d6fbf1  # main @ 2025-12-07
+        with:
+          parameters: ./performous/.github/macports-settings.yml
+          enable-cache: 'false'
+
+      - name: Amend macports configuration
+        run: |
+          sudo port sync
+          echo macosx_deployment_target ${{ matrix.target }} | tee -a /opt/local/etc/macports/macports.conf
+          echo cxx_stdlib libc++ | tee -a /opt/local/etc/macports/macports.conf
+          echo buildmakejobs 0 | tee -a /opt/local/etc/macports/macports.conf
+          echo startupitem_type none | tee -a /opt/local/etc/macports/macports.conf
+          echo build_arch $(uname -m) | tee -a /opt/local/etc/macports/macports.conf
+          echo build_arch $(uname -m) | tee -a /opt/local/etc/macports/macports.conf
+          echo boost.version ${BOOST_VERSION} | tee -a /opt/local/etc/macports/macports.conf
+
+          sudo mkdir -p /opt/custom_portfiles/www/
+          sudo portindex \
+          /opt/local/var/macports/sources/rsync.macports.org/macports/release/tarballs/ports/
+          sudo cp -Rvf $(dirname $(port file cpprestsdk)) /opt/custom_portfiles/www/
+          sudo mkdir -p /opt/custom_portfiles/www/cpprestsdk/files
+
+          sudo cp -vf ./performous/.github/support-boost-1.87.patch /opt/custom_portfiles/www/cpprestsdk/files/
+
+          sudo mkdir -p /opt/custom_portfiles/graphics/
+          sudo cp -Rv $(dirname $(port file librsvg)) /opt/custom_portfiles/graphics/
+
+          sudo cat <<EOF | sudo tee -a /opt/custom_portfiles/graphics/librsvg/Portfile
+          configure.ldflags-append -Wl,-headerpad_max_install_names
+          EOF
+
+          sudo cat <<EOF | sudo tee -a /opt/custom_portfiles/www/cpprestsdk/Portfile
+            patchfiles-append support-boost-1.87.patch
+            configure.args-append -DCPPREST_EXCLUDE_WEBSOCKETS=ON
+            depends_build-delete port:websocketpp
+          EOF
+
+          sudo cat <<EOF | sudo tee /opt/local/etc/macports/sources.conf
+          file:///opt/custom_portfiles [nosync]
+          rsync://rsync.macports.org/macports/release/tarballs/ports.tar [default]
+          EOF
+
+          sudo portindex /opt/custom_portfiles
+
+      - name: Generate versions file for cache-key.
+        run: |
+          echo macOS $(sw_vers -productVersion | cut -f1 -d.) | tee "${{ github.workspace }}/cache-key.txt"
+          echo CPU Type: $(uname -m) | tee -a "${{ github.workspace }}/cache-key.txt"
+          echo Deployment target: ${{ matrix.target }} | tee -a "${{ github.workspace }}/cache-key.txt"
+
+          port info --fullname ${MACOS_DEPS} boost.version=${BOOST_VERSION} | \
+          grep -v -e'^--$' | cut -w -f2-3 | \
+          sed -E 's/@([[:digit:]]+)\.([[:digit:]]+)\.([[:digit:]]+){1}((\+|-)[a-zA-Z0-9_]+)*/@\1.\2/g' | \
+          tee -a "${{ github.workspace }}/cache-key.txt"
+
+          echo contents of cache-key-file:
+          cat "${{ github.workspace }}/cache-key.txt"
+
+      - name: Compute cache-key
+        id: cache-key
+        run: |
+          # Identical formula to macports.yml so this shares cache entries with it.
+          echo "computed_cache_key=macports-${{matrix.os}}-${{ hashFiles('cache-key.txt') }}" >> $GITHUB_OUTPUT
+
+      - name: Try to restore cache
+        id: restore_cache
+        uses: Lord-Kamina/always-upload-cache/restore@902f08f140eca7313b6e363505b284257e85293d  # refresh-cache @ 2026-05-22
+        with:
+          path: |
+            /opt/local/
+            /Applications/MacPorts/
+          key: '${{ steps.cache-key.outputs.computed_cache_key }}'
+
+      - name: Unlink Homebrew
+        run: |
+          brew unlink $(brew list --formula)
+          echo cmake: $(which cmake)
+
+      - name: Install Dependencies
+        run: |
+          . "${{ github.workspace}}/performous/.github/try_binary_first.sh"
+          set -x
+          if [[ "${{ steps.restore_cache.outputs.cache-hit }}" == "true" ]]; then
+            echo "Installed but inactive ports: "
+            sudo port -v installed inactive
+            sudo port activate -f installed boost.version=${BOOST_VERSION}
+          else
+            sudo portindex /opt/custom_portfiles
+          fi
+
+          echo buildfromsource ifneeded | tee -a /opt/local/etc/macports/macports.conf
+          echo keeplogs yes | tee -a /opt/local/etc/macports/macports.conf
+          sudo port install -s icu gettext-runtime
+
+          set +x
+          set +e
+          sudo rm -rvf /opt/local/var/macports/build
+
+          try_binary_first autoconf autoconf-archive automake bison cargo cctools clang-18 libgcc gcc15 gcc15-libcxx cmake docbook-xml docbook-xsl-nons flex gi-docgen git gmake gperf gtk-doc itstool meson mm-common nasm ninja p7zip perl5 pkgconfig py313-docutils py313-build py313-cython py313-installer py313-wheel python313 rust texinfo unzip vim websocketpp xmlto yasm boost.version=${BOOST_VERSION}
+
+          set -x
+          sudo port -s install ${MACOS_DEPS} boost.version=${BOOST_VERSION}
+
+          echo "Installed ports: "
+          port installed
+
+          sudo port -v uninstall gcc* clang* llvm* || true
+          sudo port clean --all installed
+          sudo port -N rev-upgrade
+          sudo port -N activate active boost.version=${BOOST_VERSION}
+          sudo port -N uninstall leaves || true
+          sudo port deactivate -f installed
+          sudo port activate -f zstd boost.version=${BOOST_VERSION}
+
+      - name: Get logs from last job
+        if: ${{ !cancelled() }}
+        id: get-logs
+        run: |
+          cd /opt/local/var/macports
+          tar -czf ${{ github.workspace }}/MacPorts-log-${{ matrix.os }}.tar.gz ./logs ./build
+          echo "log_path=${{ github.workspace }}/MacPorts-log-${{ matrix.os }}.tar.gz" >> $GITHUB_OUTPUT
+
+      - name: Clear Extended attributes
+        run: |
+          sudo find /opt/local/var -type d -a -perm 700 -exec chmod 755 {} \;
+          sudo xattr -c -rsv /opt/local
+
+      - name: Cache dependencies
+        # refresh-cache:false (upstream uses true). `true` DELETES the matched entry
+        # before re-saving; from a feature branch that would destroy the
+        # default-branch-scoped cache that every other branch depends on.
+        # Also skip the save entirely on a hit - nothing changed.
+        if: ${{ steps.restore_cache.outputs.cache-hit != 'true' }}
+        uses: Lord-Kamina/always-upload-cache/save@902f08f140eca7313b6e363505b284257e85293d
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          refresh-cache: false
+          path: |
+            /opt/local/
+            /Applications/MacPorts/
+          key: '${{ steps.cache-key.outputs.computed_cache_key }}'
+
+      - name: Build package
+        id: build_package
+        run: |
+          sudo port activate -f installed boost.version=${BOOST_VERSION}
+          cd performous/osx-utils
+          chmod +x ./macos-bundler.py
+          python3 -m venv ./bundler-venv
+          source ./bundler-venv/bin/activate
+          pip3 install -r ./macos-bundler-requirements.txt
+          python3 ./macos-bundler.py --flat-output --verify-bundle \
+            --package-version="${{ steps.ver.outputs.package_version }}" \
+            --target="${{ matrix.target }}" \
+            --enable-webserver=on --enable-midi=on --enable-webcam=on --build-tests=on --prefer-macports
+          PACKAGE_PATH="${{ github.workspace }}/performous/osx-utils/out/Performous-${{ steps.ver.outputs.package_version }}-$(uname -m).dmg"
+          echo "ARTIFACT_PATH=${PACKAGE_PATH}" >> ${GITHUB_ENV}
+          echo "ARTIFACT_NAME=Performous-${{ steps.ver.outputs.safe_ref }}-${{ steps.ver.outputs.short_sha }}-$(uname -m)-macos${{ matrix.target }}" >> ${GITHUB_ENV}
+
+      - name: Run unittests directly called.
+        run: |
+          cd "${{ github.workspace }}/performous/build/testing"
+          ./performous_test --gtest_filter=UnitTest*
+
+      - name: Run unittests by ctest.
+        run: |
+          cd "${{ github.workspace }}/performous/build"
+          make test
+
+      - name: Upload DMG
+        id: upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.ARTIFACT_PATH }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Summary
+        if: ${{ always() && env.ARTIFACT_NAME != '' }}
+        run: |
+          {
+            echo "### macOS DMG"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| branch | \`${{ github.ref_name }}\` |"
+            echo "| commit | \`${{ steps.ver.outputs.short_sha }}\` |"
+            echo "| runner / target | \`${{ matrix.os }}\` / \`${{ matrix.target }}\` |"
+            echo "| artifact | \`${{ env.ARTIFACT_NAME }}\` |"
+            echo "| cache | \`${{ steps.restore_cache.outputs.cache-hit == 'true' && 'hit' || 'MISS (cold build)' }}\` |"
+            echo ""
+            echo "After downloading and unzipping, the .app is unsigned; clear quarantine with:"
+            echo '```'
+            echo 'xattr -dr com.apple.quarantine /Applications/Performous.app'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload logs
+        if: ${{ steps.get-logs.outputs.log_path != null && !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: "MacPorts-log-${{ matrix.os }}-${{ steps.ver.outputs.short_sha }}.tar.gz"
+          path: "${{ steps.get-logs.outputs.log_path }}"
