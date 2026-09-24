@@ -360,10 +360,17 @@ jobs:
           # `Lord-Kamina/always-upload-cache/save` (like actions/cache) downgrades
           # every save failure to a ::warning:: and still reports step success, so a
           # broken cache is invisible until you notice builds are permanently cold.
-          gh api "repos/${{ github.repository }}/actions/caches?key=${CACHE_KEY}" \
-            --jq '.actions_caches[] | "\(.size_in_bytes) bytes  ref=\(.ref)  \(.key)"'
-          n=$(gh api "repos/${{ github.repository }}/actions/caches?key=${CACHE_KEY}" --jq '.total_count')
+          #
+          # curl + python3 rather than `gh`: the "Unlink Homebrew" step earlier in
+          # this job takes gh off PATH, so `gh api` here exits 127.
+          resp=$(curl -fsSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/caches?key=${CACHE_KEY}")
+          printf '%s' "${resp}" | python3 -c "import json,sys; [print('  %s bytes  ref=%s  %s' % (c['size_in_bytes'], c['ref'], c['key'])) for c in json.load(sys.stdin)['actions_caches']]"
+          n=$(printf '%s' "${resp}" | python3 -c "import json,sys; print(json.load(sys.stdin)['total_count'])")
           if [ "${n}" -eq 0 ]; then
             echo "::error::Cache save failed silently - no entry for ${CACHE_KEY}. Every subsequent build will be a ~70min cold build."
             exit 1
           fi
+          echo "Cache verified: ${n} entry/entries for ${CACHE_KEY}"
