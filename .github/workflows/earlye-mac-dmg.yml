@@ -263,7 +263,11 @@ jobs:
           # dependency cache has never saved, on either arm64 or Intel.
           # a+rX adds read everywhere and search only on directories; it does not
           # clear setuid, and /opt/local is a throwaway CI prefix.
-          sudo chmod -R a+rX /opt/local /Applications/MacPorts
+          sudo chmod -R a+rX /opt/local
+          # /Applications/MacPorts is in the cache path list but is not created on
+          # every runner image, so chmod it only if it is actually there -- an
+          # unguarded chmod exits 1 and takes the whole job down with it.
+          if [ -d /Applications/MacPorts ]; then sudo chmod -R a+rX /Applications/MacPorts; fi
           sudo xattr -c -rsv /opt/local
 
       - name: Cache dependencies
