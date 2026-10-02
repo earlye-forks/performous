@@ -196,7 +196,18 @@ jobs:
 
       - name: Try to restore cache
         id: restore_cache
-        uses: Lord-Kamina/always-upload-cache/restore@902f08f140eca7313b6e363505b284257e85293d  # refresh-cache @ 2026-05-22
+        # Stock actions/cache, not Lord-Kamina/always-upload-cache (which upstream's
+        # macports.yml uses). That fork restores correctly -- the log says "Cache hit
+        # for: <key>" and the 875MB is pulled down -- but it does not populate its
+        # documented `cache-hit` output, so every consumer below saw a miss, the
+        # expensive branch of Install Dependencies ran anyway, and the save
+        # re-uploaded a duplicate entry on every feature branch.
+        #
+        # The fork exists to provide `refresh-cache`, which we deliberately do not
+        # use, so stock is behaviourally identical here and drops two third-party
+        # actions pinned to moving refs. The cache KEY formula is unchanged, which
+        # is what has to stay byte-identical to upstream, not the action.
+        uses: actions/cache/restore@v4
         with:
           path: |
             /opt/local/
@@ -271,16 +282,18 @@ jobs:
           sudo xattr -c -rsv /opt/local
 
       - name: Cache dependencies
-        # refresh-cache:false (upstream uses true). `true` DELETES the matched entry
-        # before re-saving; from a feature branch that would destroy the
-        # default-branch-scoped cache that every other branch depends on.
-        # Also skip the save entirely on a hit - nothing changed.
+        # Skipped on a hit: the tree is unchanged, and re-saving from a feature
+        # branch just burns the 10GB repo quota with a duplicate ~875MB entry --
+        # about eleven branches would start evicting each other, master's entry
+        # included.
+        #
+        # Upstream passes refresh-cache:true to the always-upload-cache fork, which
+        # DELETES the matched entry before re-saving. From a feature branch that
+        # would destroy the default-branch entry every other branch depends on.
+        # Stock save has no such behaviour, which is what we want.
         if: ${{ steps.restore_cache.outputs.cache-hit != 'true' }}
-        uses: Lord-Kamina/always-upload-cache/save@902f08f140eca7313b6e363505b284257e85293d
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: actions/cache/save@v4
         with:
-          refresh-cache: false
           path: |
             /opt/local/
             /Applications/MacPorts/
