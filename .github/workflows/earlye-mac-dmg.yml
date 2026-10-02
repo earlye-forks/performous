@@ -263,22 +263,39 @@ jobs:
           tar -czf ${{ github.workspace }}/MacPorts-log-${{ matrix.os }}.tar.gz ./logs ./build
           echo "log_path=${{ github.workspace }}/MacPorts-log-${{ matrix.os }}.tar.gz" >> $GITHUB_OUTPUT
 
-      - name: Clear Extended attributes
+      - name: Prepare /opt/local for caching
         run: |
           sudo find /opt/local/var -type d -a -perm 700 -exec chmod 755 {} \;
-          # actions/cache runs `tar` as the unprivileged `runner` user, and bsdtar
-          # exits 1 on the FIRST unreadable file, aborting the entire save. MacPorts
-          # installs a handful of root-owned, non-world-readable helpers -- notably
-          # dbus's setuid `dbus-daemon-launch-helper`, pulled in transitively by
-          # glib2 -- which `runner` cannot read. This is why upstream's macOS
-          # dependency cache has never saved, on either arm64 or Intel.
-          # a+rX adds read everywhere and search only on directories; it does not
-          # clear setuid, and /opt/local is a throwaway CI prefix.
+
+          # actions/cache runs `tar` as the unprivileged `runner` user, for BOTH
+          # halves, and MacPorts leaves the prefix full of root-owned files because
+          # every port was installed via `sudo port`. That breaks each half
+          # differently:
+          #
+          #   save:    bsdtar exits 1 on the first unreadable file -- dbus's setuid
+          #            `dbus-daemon-launch-helper`, pulled in transitively by glib2.
+          #            This is why upstream's macOS cache has never saved, on either
+          #            arm64 or Intel.
+          #   restore: gtar extracts the tree but cannot utime root-owned
+          #            directories, exits 2, and actions/cache reports the whole
+          #            thing as a miss -- "Cache not found for input keys" -- even
+          #            though it just downloaded and unpacked 875MB.
+          #
+          # chown fixes both, and restores the prefix to the state setup-macports
+          # itself leaves it in (it does the same chown at install time, before
+          # `sudo port` starts creating root-owned files). chmod a+rX is kept as
+          # belt and braces for anything chown misses.
+          sudo chown -R "$(id -u -n):$(id -g -n)" /opt/local
           sudo chmod -R a+rX /opt/local
+
           # /Applications/MacPorts is in the cache path list but is not created on
-          # every runner image, so chmod it only if it is actually there -- an
-          # unguarded chmod exits 1 and takes the whole job down with it.
-          if [ -d /Applications/MacPorts ]; then sudo chmod -R a+rX /Applications/MacPorts; fi
+          # every runner image, so touch it only if it is actually there -- an
+          # unguarded chown/chmod exits 1 and takes the whole job down with it.
+          if [ -d /Applications/MacPorts ]; then
+            sudo chown -R "$(id -u -n):$(id -g -n)" /Applications/MacPorts
+            sudo chmod -R a+rX /Applications/MacPorts
+          fi
+
           sudo xattr -c -rsv /opt/local
 
       - name: Cache dependencies
