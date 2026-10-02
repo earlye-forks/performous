@@ -194,6 +194,23 @@ jobs:
           # Identical formula to macports.yml so this shares cache entries with it.
           echo "computed_cache_key=macports-${{matrix.os}}-${{ hashFiles('cache-key.txt') }}" >> $GITHUB_OUTPUT
 
+      - name: Make /opt/local writable before restore
+        run: |
+          # `sudo port sync` in "Amend macports configuration" repopulates
+          # /opt/local/var/macports/sources as root. actions/cache extracts as the
+          # unprivileged runner user, which then cannot overwrite those files: gtar
+          # reports "Cannot open: File exists" on each one and exits non-zero, so
+          # the action discards an otherwise good 880MB restore and reports
+          # "Cache not found for input keys".
+          #
+          # This is the same ownership problem as the chown before the save, at the
+          # other end of the job. The save needs the ARCHIVE to be runner-owned; the
+          # restore needs the EXTRACTION TARGET to be runner-owned.
+          sudo chown -R "$(id -u -n):$(id -g -n)" /opt/local
+          if [ -d /Applications/MacPorts ]; then
+            sudo chown -R "$(id -u -n):$(id -g -n)" /Applications/MacPorts
+          fi
+
       - name: Try to restore cache
         id: restore_cache
         # Stock actions/cache, not Lord-Kamina/always-upload-cache (which upstream's
@@ -308,7 +325,13 @@ jobs:
         # DELETES the matched entry before re-saving. From a feature branch that
         # would destroy the default-branch entry every other branch depends on.
         # Stock save has no such behaviour, which is what we want.
-        if: ${{ steps.restore_cache.outputs.cache-hit != 'true' }}
+        #
+        # Gated on master as well as on the miss: a cache entry is only useful in
+        # the default-branch scope, since that is the only scope every other branch
+        # can read. A feature-branch save is unreadable by any other branch and just
+        # burns ~880MB of the 10GB repo quota, so if the restore ever regresses
+        # again this cannot quietly fill the quota and evict master's entry.
+        if: ${{ github.ref == 'refs/heads/master' && steps.restore_cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
         with:
           path: |
@@ -382,7 +405,8 @@ jobs:
       # Last step in the job, so a cache regression fails the run loudly without
       # costing the DMG -- which is already uploaded by the time this runs.
       - name: Verify cache was saved
-        if: ${{ steps.restore_cache.outputs.cache-hit != 'true' }}
+        # Same gate as the save step above, so this verifies what that step did.
+        if: ${{ github.ref == 'refs/heads/master' && steps.restore_cache.outputs.cache-hit != 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CACHE_KEY: ${{ steps.cache-key.outputs.computed_cache_key }}
