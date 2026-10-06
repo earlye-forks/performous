@@ -12,6 +12,11 @@ Discord at https://discord.gg/NS3m3ad
 
 For compiling instructions visit the wiki page: https://github.com/performous/performous/wiki/Building-and-installing-from-source
 
+# About This Fork
+This repository is a fork of the upstream [Performous](https://github.com/performous/performous) project. It carries a small set of fork-local changes applied on top of upstream (such as a CI workflow that builds macOS DMGs from feature branches), tracked as prompts rather than as a diverging code history.
+
+If you are re-mirroring this fork from a newer upstream release, see the fork's NQAF prompt history for the prompts that produced the current changes, and re-apply them.
+
 # Pre-compiled builds
 Performous currently builds on Windows(MSVC and MinGW-w64), macOS, and various versions of Ubuntu, Debian, Fedora, as well as an AppImage build.
 
